@@ -827,9 +827,11 @@ def main():
             channel_last=False,
             debug_mode=DEBUG_MODE,
         )
+        micro_batch_size = config.training_params.micro_batch_size
+        val_sample_batch_size = micro_batch_size // 4 if micro_batch_size > 4 else micro_batch_size
         val_sample_loader = DataLoader(
             val_sample_dataset,
-            batch_size=config.training_params.micro_batch_size // 4 or 1,
+            batch_size=val_sample_batch_size,
             shuffle=False,
             collate_fn=dynamic_sequential_collate,
             num_workers=config.training_params.num_workers if not DEBUG_MODE else 0,

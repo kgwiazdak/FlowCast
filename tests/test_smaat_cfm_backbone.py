@@ -11,8 +11,8 @@ import torch
 
 from common.models.smaat_cfm.backbone import SmaatCFMBackbone
 
-INPUT_SHAPE = (13, 24, 24, 4)  # (T_in, H, W, C) -- matches SEVIR VIL latent dims
-TARGET_SHAPE = (12, 24, 24, 4)  # (T_out, H, W, C)
+INPUT_SHAPE = (13, 48, 48, 4)  # (T_in, H, W, C) -- matches SEVIR VIL latent dims
+TARGET_SHAPE = (12, 48, 48, 4)  # (T_out, H, W, C)
 BATCH_SIZE = 2
 
 MIN_EXPECTED_PARAMS = 1_000_000
