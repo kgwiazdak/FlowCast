@@ -54,13 +54,15 @@ class SmaatCFMBackbone(nn.Module):
         mean, std:
             Latent-space normalization statistics, mirroring
             `CuboidTransformerUNet`'s `normalize`/`unnormalize` contract used by the
-            training loop. Registered as (non-persistent) buffers -- unlike
-            `CuboidTransformerUNet`, which stores them as plain attributes -- so they
-            move with the model on `.to(device)` instead of silently staying on CPU.
+            training loop. Stored as plain attributes (not buffers/parameters),
+            matching `CuboidTransformerUNet` exactly: they stay on CPU even after
+            `.to(device)`, which the reused `partial_evaluate_model` (and PyTorch's
+            0-dim-CPU-tensor/CUDA-tensor broadcasting) relies on -- e.g. it calls
+            `model.std.numpy()` directly, which would break if these were CUDA buffers.
         """
         super().__init__()
-        self.register_buffer("mean", torch.as_tensor(mean, dtype=torch.float32), persistent=False)
-        self.register_buffer("std", torch.as_tensor(std, dtype=torch.float32), persistent=False)
+        self.mean = torch.as_tensor(mean, dtype=torch.float32)
+        self.std = torch.as_tensor(std, dtype=torch.float32)
         assert depth >= 2, "depth must allow at least one downsample/upsample pair"
         t_in, h, w, c_in = input_shape
         t_out, h_out, w_out, c_out = target_shape
