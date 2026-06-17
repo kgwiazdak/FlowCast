@@ -17,6 +17,7 @@ import copy
 import argparse
 import datetime
 import random
+import warnings
 
 import numpy as np
 import wandb
@@ -48,6 +49,9 @@ from common.utils.utils import EarlyStopping, compute_mean_std, warmup_lambda, e
 from common.models.flowcast.cuboid_transformer_unet import CuboidTransformerUNet
 from common.models.smaat_cfm.backbone import SmaatCFMBackbone
 from common.cfm.cfm import ConditionalFlowMatcher
+from common.metrics.metrics_streaming_probabilistic import MetricsAccumulator
+from common.utils.utils import calculate_metrics
+from experiments.sevir.dataset.sevirfulldataset import post_process_samples
 from experiments.sevir.runner.flowcast.dist_train_flowcast import (
     partial_evaluate_model,
 )
@@ -158,6 +162,202 @@ def build_backbone(backbone_type, input_shape, target_shape, config, mean, std):
         raise ValueError(f"Unknown backbone_type: {backbone_type!r}. Expected 'cuboid' or 'smaat'.")
 
 
+def compute_model_output_and_target(model, flow_matcher, x0_cond, x1, training_mode, device):
+    """Produces (model_output, regression_target) for one batch, branching on
+    training_mode so the same backbone/shape is used in both modes:
+
+    - "cfm": samples noise x0 and flow time t, interpolates x_t along the CFM
+      path, and asks the model to predict the velocity field u_t = x1 - x0.
+    - "deterministic": skips noise/time sampling entirely. The "noised future
+      state" input is replaced by a constant zero placeholder and the flow
+      time is fixed at t=1 (the "fully resolved" value), so the model directly
+      regresses the (normalized) future latent state x1 from the past (cond)
+      -- isolating the backbone's contribution from the CFM framework's.
+    """
+    if training_mode == "cfm":
+        x0_noise = torch.randn_like(x1, device=device)
+        t, x_t, u_t = flow_matcher.sample_location_and_conditional_flow(x0_noise, x1)
+        v_t = model(t, x_t, x0_cond)
+        return v_t, u_t
+    elif training_mode == "deterministic":
+        batch_size = x1.shape[0]
+        x_placeholder = torch.zeros_like(x1)
+        t_full = torch.ones(batch_size, device=device)
+        pred = model(t_full, x_placeholder, x0_cond)
+        return pred, x1
+    else:
+        raise ValueError(f"Unknown training_mode: {training_mode!r}. Expected 'cfm' or 'deterministic'.")
+
+
+def partial_evaluate_model_deterministic(
+    model,
+    device,
+    val_sample_loader,
+    thresholds,
+    global_step,
+    epoch,
+    ae_model,
+    normalized_autoencoder,
+    use_fp16,
+    partial_evaluation_batches,
+    lead_time,
+    enable_wandb,
+    wandb_instance,
+    debug_print_prefix,
+    ema_model_evaluated,
+    batch_size_autoencoder=None,
+):
+    """Deterministic-mode counterpart to `partial_evaluate_model` (imported above).
+
+    In CFM mode, the model output is a velocity field that has to be ODE-integrated
+    from random noise to get a prediction. In deterministic mode the model directly
+    outputs the predicted future latent state (see compute_model_output_and_target),
+    so there is no ODE to integrate, no ensemble to sample, and only ever one
+    prediction per input -- using `partial_evaluate_model`'s ODE-integration path
+    here would be meaningless. The encode/normalize/decode/metrics plumbing mirrors
+    `partial_evaluate_model`; only the prediction step differs.
+    """
+    results = None
+    model.eval()
+    if ae_model:
+        ae_model.eval()
+
+    with torch.no_grad():
+        metrics_accumulators = [
+            MetricsAccumulator(
+                lead_time=lt,
+                thresholds=thresholds,
+                pool_size=16,
+                compute_mse=True,
+                compute_threshold=True,
+                compute_crps=False,
+                compute_fss=True,
+                fss_scales=[1, 4, 16],
+                device=device,
+            )
+            for lt in range(lead_time)
+        ]
+        count = 0
+        y_pred_batches = []
+        y_true_batches = []
+
+        eval_bar = tqdm(val_sample_loader, desc=f"Partial Eval (deterministic) Epoch {epoch}", leave=False)
+        for batch in eval_bar:
+            x_cond, x_true, metadata = batch
+            x_cond = x_cond.to(device, non_blocking=True)
+            x_true = x_true.to(device, non_blocking=True)
+
+            B, C, T_in, H, W = x_cond.shape
+            x_cond = x_cond.permute(0, 2, 1, 3, 4).reshape(B * T_in, C, H, W)
+            if normalized_autoencoder:
+                x_cond = x_cond / 255.0
+
+            if ae_model:
+                encoded_chunks = []
+                bs_ae = batch_size_autoencoder if batch_size_autoencoder is not None else x_cond.shape[0]
+                for i in range(0, x_cond.shape[0], bs_ae):
+                    chunk = x_cond[i : i + bs_ae]
+                    encoded_chunk = ae_model.encode(chunk).latent_dist.mode()
+                    encoded_chunks.append(encoded_chunk)
+                x_cond = torch.cat(encoded_chunks, dim=0)
+            else:
+                print(f"{debug_print_prefix}Warning: AE model not available for encoding in partial eval.")
+                latent_channels, latent_H, latent_W = 4, H // 8, W // 8
+                x_cond = torch.randn(B * T_in, latent_channels, latent_H, latent_W, device=device)
+
+            latent_channels, latent_H, latent_W = x_cond.shape[1], x_cond.shape[2], x_cond.shape[3]
+            x_cond = x_cond.reshape(B, T_in, latent_channels, latent_H, latent_W).permute(0, 2, 1, 3, 4)
+            x_cond = model.normalize(x_cond)
+            x_cond = x_cond.permute(0, 2, 3, 4, 1)
+
+            B, Tin, Hz, Wz, Cz = x_cond.shape
+            x_true = x_true.squeeze(1)
+            T_future = x_true.shape[1]
+            H_true, W_true = x_true.shape[2], x_true.shape[3]
+
+            x_placeholder = torch.zeros((B, T_future, Hz, Wz, Cz), device=device)
+            t_full = torch.ones(B, device=device)
+            with torch.amp.autocast(device_type=device.type, enabled=use_fp16):
+                x_pred_sample = model(t_full, x_placeholder, x_cond)
+
+            x_pred = x_pred_sample.unsqueeze(1)  # single sample -> (B, S=1, T, Hz, Wz, Cz)
+
+            x_pred_np = x_pred.cpu().numpy()
+            x_true_np = x_true.cpu().numpy()
+            x_pred_np = (x_pred_np * model.std.numpy() + model.mean.numpy()).astype(np.float32)
+
+            B, S, T, H_latent, W_latent, C_latent = x_pred_np.shape
+            x_pred_np = x_pred_np.reshape(B * S * T, H_latent, W_latent, C_latent)
+            x_pred_tensor = torch.from_numpy(x_pred_np).to(device)
+            x_pred_tensor = x_pred_tensor.permute(0, 3, 1, 2)
+
+            if ae_model:
+                decoded_chunks = []
+                bs_ae = batch_size_autoencoder if batch_size_autoencoder is not None else x_pred_tensor.shape[0]
+                for i in range(0, x_pred_tensor.shape[0], bs_ae):
+                    chunk = x_pred_tensor[i : i + bs_ae]
+                    decoded_chunk = ae_model.decode(chunk).sample
+                    decoded_chunks.append(decoded_chunk)
+                x_pred_tensor = torch.cat(decoded_chunks, dim=0)
+            else:
+                print(f"{debug_print_prefix}Warning: AE model not available for decoding in partial eval.")
+                x_pred_tensor = torch.rand(B * S * T, 1, H_true, W_true, device=device) * 255.0
+
+            if normalized_autoencoder:
+                x_pred_tensor = x_pred_tensor * 255.0
+
+            if torch.isnan(x_pred_tensor).any():
+                print(f"{debug_print_prefix} WARNING: NaN values found in x_pred after decode (likely due to FP16) - Please rerun with fp16: false")
+
+            x_pred_tensor = x_pred_tensor.reshape(B, S, T, 1, H_true, W_true)
+            x_pred_tensor = x_pred_tensor.permute(0, 1, 2, 4, 5, 3)
+            if x_pred_tensor.shape[-1] == 1:
+                x_pred_tensor = x_pred_tensor.squeeze(-1)
+
+            x_pred_np = x_pred_tensor.cpu().numpy().astype(np.float32)
+
+            y_pred_batches.append(x_pred_np)
+            y_true_batches.append(x_true_np)
+
+            count += B
+            if count >= partial_evaluation_batches * val_sample_loader.batch_size:
+                break
+        eval_bar.close()
+
+        if not y_pred_batches:
+            print(f"{debug_print_prefix}No batches processed during deterministic partial evaluation.")
+            return None
+
+        y_pred_array = np.concatenate(y_pred_batches, axis=0)
+        y_true_array = np.concatenate(y_true_batches, axis=0)
+        y_pred_array = post_process_samples(y_pred_array, clamp_min=0.0, clamp_max=255.0)
+
+        for metrics_accumulator in metrics_accumulators:
+            metrics_accumulator.update(y_true_array, y_pred_array)
+
+        results = calculate_metrics(num_lead_times=lead_time, metrics_accumulators=metrics_accumulators, thresholds=thresholds)
+        EMA_SUFFIX = "(EMA)" if ema_model_evaluated else ""
+        print(
+            f"{debug_print_prefix}Partial Results (deterministic) {EMA_SUFFIX}: "
+            f"MSE: {results.get('mse_from_mean_mean', 'N/A')}, CSI-M: {results.get('csi_from_mean_m', 'N/A')}, "
+            f"HSS-M: {results.get('hss_from_mean_m', 'N/A')}, FAR-M: {results.get('far_from_mean_m', 'N/A')}"
+        )
+
+        if enable_wandb and wandb_instance:
+            ema_suffix_wandb = "_EMA" if ema_model_evaluated else ""
+            wandb_instance.log(
+                {
+                    f"partial_mse{ema_suffix_wandb}": results["mse_from_mean_mean"],
+                    f"partial_csi_m{ema_suffix_wandb}": results["csi_from_mean_m"],
+                    f"partial_hss_m{ema_suffix_wandb}": results["hss_from_mean_m"],
+                    f"partial_far_m{ema_suffix_wandb}": results["far_from_mean_m"],
+                },
+                step=global_step,
+            )
+
+    return results
+
+
 def run_training(
     config,
     train_dataset,
@@ -181,8 +381,23 @@ def run_training(
     DEBUG_MODE = config.run_params.debug_mode
     BACKBONE_TYPE = config.run_params.backbone_type
     RUN_STRING = config.run_params.run_string
+    TRAINING_MODE = config.run_params.get("training_mode", "cfm")
+    if TRAINING_MODE not in ("cfm", "deterministic"):
+        raise ValueError(f"Unknown training_mode: {TRAINING_MODE!r}. Expected 'cfm' or 'deterministic'.")
     if enable_wandb is None:
         enable_wandb = config.run_params.enable_wandb
+
+    if TRAINING_MODE == "deterministic":
+        probabilistic_samples = config.get("test_params", {}).get("probabilistic_samples", 1)
+        if probabilistic_samples and probabilistic_samples > 1:
+            warnings.warn(
+                f"training_mode='deterministic' but test_params.probabilistic_samples="
+                f"{probabilistic_samples} (>1). Deterministic mode produces exactly one "
+                "prediction per input; computing probabilistic ensemble metrics (e.g. CRPS) "
+                "over duplicated copies of that same prediction would be misleading. Partial "
+                "evaluation below always uses a single sample regardless of this config value; "
+                "set test_params.probabilistic_samples=1 for the final evaluation too."
+            )
 
     PARTIAL_EVALUATION = config.partial_evaluation_params.partial_evaluation and val_sample_loader is not None
     PARTIAL_EVALUATION_INTERVAL = config.partial_evaluation_params.partial_evaluation_interval
@@ -380,15 +595,13 @@ def run_training(
             inputs, outputs, metadata = batch
             x1 = outputs.to(device, non_blocking=True)
             x0_cond = inputs.to(device, non_blocking=True)
-            x0_noise = torch.randn_like(x1, device=device)
 
             x0_cond = model.normalize(x0_cond)
             x1 = model.normalize(x1)
 
             with torch.amp.autocast(device_type=device.type, enabled=USE_FP16):
-                t, x_t, u_t = flow_matcher.sample_location_and_conditional_flow(x0_noise, x1)
-                v_t = model(t, x_t, x0_cond)
-                raw_per_sample_loss = criterion(v_t, u_t)
+                pred, target = compute_model_output_and_target(model, flow_matcher, x0_cond, x1, TRAINING_MODE, device)
+                raw_per_sample_loss = criterion(pred, target)
                 dims_to_reduce = list(range(1, raw_per_sample_loss.ndim))
                 final_batch_loss = raw_per_sample_loss.mean(dim=dims_to_reduce).mean()
 
@@ -439,15 +652,13 @@ def run_training(
                 inputs, outputs, metadata = batch
                 x1 = outputs.to(device, non_blocking=True)
                 x0_cond = inputs.to(device, non_blocking=True)
-                x0_noise = torch.randn_like(x1, device=device)
 
                 x0_cond = model.normalize(x0_cond)
                 x1 = model.normalize(x1)
 
                 with torch.amp.autocast(device_type=device.type, enabled=USE_FP16):
-                    t, x_t, u_t = flow_matcher.sample_location_and_conditional_flow(x0_noise, x1)
-                    v_t = model(t, x_t, x0_cond)
-                    loss = criterion(v_t, u_t).mean()
+                    pred, target = compute_model_output_and_target(model, flow_matcher, x0_cond, x1, TRAINING_MODE, device)
+                    loss = criterion(pred, target).mean()
 
                 val_loss_accum += loss.item() * inputs.size(0)
                 val_count += inputs.size(0)
@@ -465,26 +676,46 @@ def run_training(
         if PARTIAL_EVALUATION and (epoch % PARTIAL_EVALUATION_INTERVAL == 0):
             eval_model = ema_model if (EMA_MODEL_SAVING and ema_model is not None) else model
             eval_model.eval()
-            partial_eval_results = partial_evaluate_model(
-                model=eval_model,
-                device=device,
-                val_sample_loader=val_sample_loader,
-                thresholds=THRESHOLDS,
-                global_step=global_step,
-                epoch=epoch,
-                ae_model=ae_model,
-                normalized_autoencoder=NORMALIZED_AUTOENCODER,
-                use_fp16=USE_FP16,
-                partial_evaluation_batches=PARTIAL_EVALUATION_BATCHES,
-                lead_time=config.data_params.lead_time,
-                enable_wandb=enable_wandb,
-                wandb_instance=wandb if enable_wandb else None,
-                debug_print_prefix="[single-gpu] ",
-                plots_folder=metrics_folder,
-                cartopy_features=CARTOPY_FEATURES,
-                ema_model_evaluated=EMA_MODEL_SAVING and ema_model is not None,
-                batch_size_autoencoder=None if BATCH_SIZE > 2 else BATCH_SIZE,
-            )
+            if TRAINING_MODE == "cfm":
+                partial_eval_results = partial_evaluate_model(
+                    model=eval_model,
+                    device=device,
+                    val_sample_loader=val_sample_loader,
+                    thresholds=THRESHOLDS,
+                    global_step=global_step,
+                    epoch=epoch,
+                    ae_model=ae_model,
+                    normalized_autoencoder=NORMALIZED_AUTOENCODER,
+                    use_fp16=USE_FP16,
+                    partial_evaluation_batches=PARTIAL_EVALUATION_BATCHES,
+                    lead_time=config.data_params.lead_time,
+                    enable_wandb=enable_wandb,
+                    wandb_instance=wandb if enable_wandb else None,
+                    debug_print_prefix="[single-gpu] ",
+                    plots_folder=metrics_folder,
+                    cartopy_features=CARTOPY_FEATURES,
+                    ema_model_evaluated=EMA_MODEL_SAVING and ema_model is not None,
+                    batch_size_autoencoder=None if BATCH_SIZE > 2 else BATCH_SIZE,
+                )
+            else:
+                partial_eval_results = partial_evaluate_model_deterministic(
+                    model=eval_model,
+                    device=device,
+                    val_sample_loader=val_sample_loader,
+                    thresholds=THRESHOLDS,
+                    global_step=global_step,
+                    epoch=epoch,
+                    ae_model=ae_model,
+                    normalized_autoencoder=NORMALIZED_AUTOENCODER,
+                    use_fp16=USE_FP16,
+                    partial_evaluation_batches=PARTIAL_EVALUATION_BATCHES,
+                    lead_time=config.data_params.lead_time,
+                    enable_wandb=enable_wandb,
+                    wandb_instance=wandb if enable_wandb else None,
+                    debug_print_prefix="[single-gpu] ",
+                    ema_model_evaluated=EMA_MODEL_SAVING and ema_model is not None,
+                    batch_size_autoencoder=None if BATCH_SIZE > 2 else BATCH_SIZE,
+                )
 
         current_lr = optimizer.param_groups[0]["lr"]
         print(f"Finished Epoch {epoch} - Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, LR: {current_lr:.6f}")

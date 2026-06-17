@@ -1,10 +1,9 @@
-# Config for the single-GPU training script (train_smaat_cfm.py).
-#
-# training_params/optimizer_params/scheduler_params/data_params/flow_matching_params/
-# ema_model_saving_params/partial_evaluation_params/autoencoder_params/test_params are
-# kept identical in value to experiments/sevir/runner/flowcast/flowcast_config.yaml so
-# the training budget matches the original FlowCast run exactly. Only run_params
-# (backbone_type) and smaat_model are new.
+# Deterministic-ablation variant of smaat_cfm_config.yaml: same backbone, same
+# training budget, but training_mode="deterministic" (plain regression, no flow
+# matching) and test_params.probabilistic_samples=1 (a single prediction per
+# input -- avoids the deterministic-mode mismatch warning in run_training and
+# avoids computing misleading probabilistic ensemble metrics on duplicated
+# copies of the same prediction).
 
 latent_model:
   base_units: 192
@@ -86,8 +85,8 @@ run_params:
   debug_mode: false
   enable_wandb: true
   backbone_type: "smaat"  # "smaat" or "cuboid"
-  training_mode: "cfm"  # "cfm" (full Conditional Flow Matching) or "deterministic" (regression ablation)
-  run_string: "cfm_smaat_single_gpu"
+  training_mode: "deterministic"  # plain regression ablation, no flow matching
+  run_string: "deterministic_smaat_single_gpu"
   preload_model: null
 
 flow_matching_params:
@@ -126,7 +125,7 @@ ema_model_saving_params:
 test_params:
   micro_batch_size: 6
   num_workers: 12
-  probabilistic_samples: 8
+  probabilistic_samples: 1
   batch_size_autoencoder: 12
   euler_steps: 10
   cartopy_features: false
