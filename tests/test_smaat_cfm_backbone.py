@@ -63,6 +63,16 @@ def test_parameter_count_in_expected_range():
     assert MIN_EXPECTED_PARAMS <= n_params <= MAX_EXPECTED_PARAMS
 
 
+def test_normalize_unnormalize_roundtrip():
+    """normalize/unnormalize must mirror CuboidTransformerUNet's contract, since the
+    training loop calls them directly on the model (outside of forward())."""
+    model = SmaatCFMBackbone(INPUT_SHAPE, TARGET_SHAPE, mean=2.0, std=3.0)
+    x = torch.randn(BATCH_SIZE, *TARGET_SHAPE)
+    normalized = model.normalize(x)
+    assert torch.allclose(normalized, (x - 2.0) / 3.0)
+    assert torch.allclose(model.unnormalize(normalized), x, atol=1e-5)
+
+
 def test_output_sensitive_to_flow_time():
     model = make_model()
     model.eval()

@@ -32,6 +32,8 @@ class SmaatCFMBackbone(nn.Module):
         depth=5,
         time_embed_dim=128,
         cbam_reduction=16,
+        mean=0.0,
+        std=1.0,
     ):
         """
         Parameters
@@ -49,8 +51,16 @@ class SmaatCFMBackbone(nn.Module):
             Dimensionality of the sinusoidal flow-time embedding before its MLP projection.
         cbam_reduction: int
             Channel reduction ratio used inside each CBAM's channel-attention MLP.
+        mean, std:
+            Latent-space normalization statistics, mirroring
+            `CuboidTransformerUNet`'s `normalize`/`unnormalize` contract used by the
+            training loop. Registered as (non-persistent) buffers -- unlike
+            `CuboidTransformerUNet`, which stores them as plain attributes -- so they
+            move with the model on `.to(device)` instead of silently staying on CPU.
         """
         super().__init__()
+        self.register_buffer("mean", torch.as_tensor(mean, dtype=torch.float32), persistent=False)
+        self.register_buffer("std", torch.as_tensor(std, dtype=torch.float32), persistent=False)
         assert depth >= 2, "depth must allow at least one downsample/upsample pair"
         t_in, h, w, c_in = input_shape
         t_out, h_out, w_out, c_out = target_shape
@@ -100,6 +110,12 @@ class SmaatCFMBackbone(nn.Module):
         )
 
         self.final_proj = nn.Conv2d(channels[0], out_channels, kernel_size=1)
+
+    def normalize(self, x):
+        return (x - self.mean) / self.std
+
+    def unnormalize(self, x):
+        return x * self.std + self.mean
 
     def forward(self, t, x, cond, verbose=False):
         """
