@@ -28,7 +28,7 @@ class SmaatCFMBackbone(nn.Module):
         self,
         input_shape,
         target_shape,
-        base_channels=40,
+        base_channels=32,
         depth=5,
         time_embed_dim=128,
         cbam_reduction=16,
@@ -47,10 +47,6 @@ class SmaatCFMBackbone(nn.Module):
             Number of channels at the shallowest U-Net level. Depth doubles channels.
         depth: int
             Number of U-Net resolution levels (1 stem + (depth-1) downsampling levels).
-            Note: if `depth` and the input spatial size combine to collapse the
-            bottleneck to 1x1, training with batch_size=1 will fail (BatchNorm
-            requires more than one value per channel). Not a concern for the
-            shipped configs (48x48 latents, depth=5 -> 3x3 bottleneck, batch_size>=3).
         time_embed_dim: int
             Dimensionality of the sinusoidal flow-time embedding before its MLP projection.
         cbam_reduction: int

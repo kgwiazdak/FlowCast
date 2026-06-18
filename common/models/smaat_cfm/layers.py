@@ -7,6 +7,22 @@ import torch
 from torch import nn
 
 
+def _group_norm(channels, max_groups=32):
+    """GroupNorm with as many groups as evenly divide `channels` (up to `max_groups`).
+
+    The original SmaAt-UNet uses BatchNorm, which is fine for its deterministic,
+    unconditional regression setting. Here the backbone is conditioned on a flow
+    time `t` sampled independently per example, so a single training batch mixes
+    examples at very different points along the noise-to-data path; BatchNorm's
+    shared batch statistics would blend those together. CuboidTransformerUNet
+    (the existing FlowCast backbone) avoids this with GroupNorm for the same
+    reason -- matching that choice here instead of carrying over BatchNorm
+    unexamined from the original (non-conditional) SmaAt-UNet.
+    """
+    num_groups = max_groups if channels % max_groups == 0 else channels
+    return nn.GroupNorm(num_groups=num_groups, num_channels=channels)
+
+
 class DepthwiseSeparableConv(nn.Module):
     """Depthwise conv (per-channel spatial filter) followed by a pointwise (1x1) conv."""
 
@@ -22,13 +38,13 @@ class DepthwiseSeparableConv(nn.Module):
             bias=False,
         )
         self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
-        self.bn = nn.BatchNorm2d(out_channels)
+        self.norm = _group_norm(out_channels)
         self.act = nn.LeakyReLU(0.1, inplace=True)
 
     def forward(self, x):
         x = self.depthwise(x)
         x = self.pointwise(x)
-        x = self.bn(x)
+        x = self.norm(x)
         return self.act(x)
 
 

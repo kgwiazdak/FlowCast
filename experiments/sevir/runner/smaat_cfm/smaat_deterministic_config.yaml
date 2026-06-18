@@ -48,7 +48,7 @@ latent_model:
   unet_res_connect: True
 
 smaat_model:
-  base_channels: 40
+  base_channels: 32
   depth: 5
   time_embed_dim: 128
   cbam_reduction: 16

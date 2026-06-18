@@ -88,9 +88,8 @@ def test_output_sensitive_to_flow_time():
 
 def test_loss_converges_on_small_synthetic_batch():
     """Convergence is checked on a smaller spatial/temporal extent than the other
-    contract tests (purely for optimization speed/robustness in CI -- shape
-    correctness at full SEVIR-like dims is already covered above) with a wider
-    batch to keep BatchNorm statistics stable.
+    contract tests, purely for optimization speed in CI -- shape correctness at
+    full SEVIR-like dims is already covered above.
     """
     torch.manual_seed(0)
     small_input_shape = (4, 16, 16, 4)
