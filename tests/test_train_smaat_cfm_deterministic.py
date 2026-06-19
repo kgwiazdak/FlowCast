@@ -1,125 +1,40 @@
-"""Tests for the deterministic regression ablation mode (issue #4).
+"""Tests for train_smaat_cfm_deterministic.py.
 
-Verifies: the cfm/deterministic training-mode switch uses the same backbone
-and shape in both modes; deterministic mode skips noise/time sampling in
-favor of a zero placeholder + fixed t=1; deterministic partial evaluation
-uses a single direct forward pass (no ODE integration, no ensemble); and a
-warning is emitted when test_params.probabilistic_samples > 1 while running
-in deterministic mode.
+This script is a diagnostic ablation, not the primary experiment (see its
+module docstring): it skips CFM's noise/time sampling and asks the backbone to
+directly regress the future latent from the past conditioning, isolating
+whether the backbone has any learnable capacity at all from whether the CFM
+framework works with it. These tests verify: the script does not depend on
+the CFM/ODE machinery at all (no flow matcher, no odeint), the CLI default
+points at the shared SmaAt config, and partial_evaluate_model_deterministic
+itself runs end-to-end (single direct forward pass, no ODE integration, no
+ensemble) and returns sane metric keys.
 """
 
-import warnings
+import inspect
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from experiments.sevir.runner.smaat_cfm.train_smaat_cfm import (
-    run_training,
-    compute_model_output_and_target,
-    partial_evaluate_model_deterministic,
-)
-from common.cfm.cfm import ConditionalFlowMatcher
+import experiments.sevir.runner.smaat_cfm.train_smaat_cfm_deterministic as train_det
 from common.models.smaat_cfm.backbone import SmaatCFMBackbone
 
-from conftest import T_IN, T_OUT, H, W, C, SyntheticLatentDataset, make_config
+from conftest import T_IN, T_OUT
 
 
-def test_deterministic_mode_uses_zero_placeholder_and_t_one():
-    model = SmaatCFMBackbone((T_IN, H, W, C), (T_OUT, H, W, C), depth=3)
-    flow_matcher = ConditionalFlowMatcher(sigma=0.01)
-    x0_cond = torch.randn(2, T_IN, H, W, C)
-    x1 = torch.randn(2, T_OUT, H, W, C)
-
-    captured = {}
-    real_forward = model.forward
-
-    def spy_forward(t, x, cond, verbose=False):
-        captured["t"] = t.clone()
-        captured["x"] = x.clone()
-        return real_forward(t, x, cond, verbose=verbose)
-
-    model.forward = spy_forward
-    pred, target = compute_model_output_and_target(model, flow_matcher, x0_cond, x1, "deterministic", torch.device("cpu"))
-
-    assert torch.equal(captured["t"], torch.ones(2))
-    assert torch.equal(captured["x"], torch.zeros(2, T_OUT, H, W, C))
-    assert torch.equal(target, x1)
-    assert pred.shape == x1.shape
+def test_config_default_points_at_smaat_config():
+    args = train_det.parser.parse_args([])
+    assert args.config == "experiments/sevir/runner/smaat_cfm/smaat_cfm_config.yaml"
 
 
-def test_cfm_mode_samples_noise_and_predicts_velocity():
-    model = SmaatCFMBackbone((T_IN, H, W, C), (T_OUT, H, W, C), depth=3)
-    flow_matcher = ConditionalFlowMatcher(sigma=0.01)
-    x0_cond = torch.randn(2, T_IN, H, W, C)
-    x1 = torch.randn(2, T_OUT, H, W, C)
-
-    pred, target = compute_model_output_and_target(model, flow_matcher, x0_cond, x1, "cfm", torch.device("cpu"))
-    assert pred.shape == x1.shape
-    assert target.shape == x1.shape
-
-
-def test_unknown_training_mode_raises():
-    model = SmaatCFMBackbone((T_IN, H, W, C), (T_OUT, H, W, C), depth=3)
-    flow_matcher = ConditionalFlowMatcher(sigma=0.01)
-    x0_cond = torch.randn(2, T_IN, H, W, C)
-    x1 = torch.randn(2, T_OUT, H, W, C)
-    try:
-        compute_model_output_and_target(model, flow_matcher, x0_cond, x1, "not_a_real_mode", torch.device("cpu"))
-        assert False, "expected ValueError"
-    except ValueError:
-        pass
-
-
-def test_run_training_smoke_deterministic_mode(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    config = make_config(tmp_path, "smaat", training_mode="deterministic")
-    train_dataset = SyntheticLatentDataset(num_samples=12, seed=0)
-    val_dataset = SyntheticLatentDataset(num_samples=6, seed=1)
-
-    result = run_training(
-        config=config,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        device=torch.device("cpu"),
-        run_id="smoke_deterministic",
-    )
-    assert result["global_step"] > 0
-
-
-def test_deterministic_mode_warns_on_probabilistic_samples_mismatch(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    config = make_config(tmp_path, "smaat", training_mode="deterministic", probabilistic_samples=8)
-    train_dataset = SyntheticLatentDataset(num_samples=4, seed=0)
-    val_dataset = SyntheticLatentDataset(num_samples=4, seed=1)
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        run_training(
-            config=config,
-            train_dataset=train_dataset,
-            val_dataset=val_dataset,
-            device=torch.device("cpu"),
-            run_id="smoke_warn",
-        )
-    assert any("probabilistic_samples" in str(w.message) for w in caught)
-
-
-def test_deterministic_mode_no_warning_when_probabilistic_samples_is_one(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    config = make_config(tmp_path, "smaat", training_mode="deterministic", probabilistic_samples=1)
-    train_dataset = SyntheticLatentDataset(num_samples=4, seed=0)
-    val_dataset = SyntheticLatentDataset(num_samples=4, seed=1)
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        run_training(
-            config=config,
-            train_dataset=train_dataset,
-            val_dataset=val_dataset,
-            device=torch.device("cpu"),
-            run_id="smoke_nowarn",
-        )
-    assert not any("probabilistic_samples" in str(w.message) for w in caught)
+def test_script_does_not_use_cfm_or_ode_machinery():
+    """A deterministic ablation has no flow time to sample and nothing to
+    integrate -- verify the CFM/ODE imports were dropped, not just unused."""
+    source = inspect.getsource(train_det)
+    assert "ConditionalFlowMatcher" not in source
+    assert "odeint" not in source
+    assert "SmaatCFMBackbone(" in source
 
 
 PIXEL_H, PIXEL_W = 32, 32
@@ -141,12 +56,12 @@ class SyntheticPixelSampleDataset(Dataset):
         return self.x[idx], self.y[idx], {"id": idx}
 
 
-def test_partial_evaluate_model_deterministic_runs_without_ae(tmp_path):
+def test_partial_evaluate_model_deterministic_runs_without_ae():
     """Exercises partial_evaluate_model_deterministic's full plumbing (no ODE
     integration, single direct forward pass) with ae_model=None, which falls
     back to a random-latent encode/decode path -- enough to confirm the
     function runs end-to-end and returns sane metric keys without requiring a
-    real pretrained VAE (out of scope for this unit test; see issue #5)."""
+    real pretrained VAE."""
     model = SmaatCFMBackbone((T_IN, PIXEL_H // 8, PIXEL_W // 8, 4), (T_OUT, PIXEL_H // 8, PIXEL_W // 8, 4), depth=2)
     model.eval()
 
@@ -157,11 +72,11 @@ def test_partial_evaluate_model_deterministic_runs_without_ae(tmp_path):
         [b[2] for b in batch],
     ))
 
-    results = partial_evaluate_model_deterministic(
+    results = train_det.partial_evaluate_model_deterministic(
         model=model,
         device=torch.device("cpu"),
         val_sample_loader=loader,
-        thresholds=__import__("numpy").array([16, 74, 133], dtype="float32"),
+        thresholds=np.array([16, 74, 133], dtype="float32"),
         global_step=0,
         epoch=0,
         ae_model=None,
@@ -172,6 +87,8 @@ def test_partial_evaluate_model_deterministic_runs_without_ae(tmp_path):
         enable_wandb=False,
         wandb_instance=None,
         debug_print_prefix="[test] ",
+        plots_folder="artifacts/test_tmp/plots",
+        cartopy_features=False,
         ema_model_evaluated=False,
     )
     assert results is not None

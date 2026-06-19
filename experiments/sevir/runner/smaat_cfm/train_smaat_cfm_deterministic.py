@@ -1,17 +1,27 @@
 """
-Distributed training script for the SmaAt-CFM model on the SEVIR dataset.
+Deterministic-regression ablation for the SmaAt-CFM backbone on SEVIR.
 
-This is a literal copy of `experiments/sevir/runner/flowcast/dist_train_flowcast.py`
-with exactly one change: the model construction block builds `SmaatCFMBackbone`
-(a SmaAt-UNet-style depthwise-separable-conv + CBAM backbone) instead of
-`CuboidTransformerUNet`. Every other part of the training procedure -- data
-loading, the Conditional Flow Matching objective, the optimizer/scheduler,
-EMA, early stopping, partial evaluation, WandB logging -- is unchanged, so any
-difference in results is attributable to the backbone swap alone.
+DIAGNOSTIC TOOL, NOT THE PRIMARY EXPERIMENT. The primary experiment is
+`train_smaat_cfm.py` (CFM mode). This script isolates one question: does the
+SmaAt-UNet-style backbone have enough capacity to learn *anything* useful on
+this latent-space nowcasting task at all, independent of whether the
+Conditional Flow Matching framework itself works with it? It does so by
+skipping noise/time sampling entirely: the flow time is fixed at t=1 (the
+"fully resolved" value) and the model is asked to directly regress the
+(normalized) future latent state from the past conditioning sequence, with a
+zero placeholder standing in for the noised state `x_t`. If this fails to
+learn, the backbone itself is the bottleneck, not the CFM machinery; if it
+succeeds but CFM mode (`train_smaat_cfm.py`) does not, the bottleneck is
+specific to the flow-matching objective/sampling.
 
-This script uses `torchrun` for multi-GPU/multi-node training. Training is
-configured via a YAML file and includes features like partial evaluation, EMA
-checkpointing, early stopping, and WandB logging.
+This is otherwise a literal copy of `train_smaat_cfm.py` (itself a literal
+copy of `experiments/sevir/runner/flowcast/dist_train_flowcast.py` with the
+backbone swapped) -- only the "what does the model predict, what is it
+compared against, and how is it evaluated" logic differs, confined to the
+training loop's loss computation, the validation loop's loss computation, and
+`partial_evaluate_model_deterministic` (a deterministic counterpart of
+`partial_evaluate_model`, since there is no ODE to integrate and no ensemble
+to sample here -- only ever one prediction per input).
 """
 
 import sys
@@ -49,9 +59,6 @@ from experiments.sevir.dataset.sevirfulldataset import (
 from common.utils.utils import EarlyStopping, compute_mean_std
 from common.models.smaat_cfm.backbone import SmaatCFMBackbone
 from omegaconf import OmegaConf
-from common.cfm.cfm import (
-    ConditionalFlowMatcher,
-)
 from common.utils.utils import warmup_lambda
 
 from common.metrics.metrics_streaming_probabilistic import (
@@ -62,7 +69,6 @@ from common.utils.utils import (
     ema,
 )
 from experiments.sevir.display.cartopy import make_animation
-from torchdiffeq import odeint_adjoint as odeint
 
 
 def setup_ddp():
@@ -165,7 +171,7 @@ def main():
     is_main_process = rank == 0
 
     DEBUG_MODE = config.run_params.debug_mode
-    RUN_STRING = config.run_params.run_string
+    RUN_STRING = config.run_params.run_string + "_deterministic"
     CARTOPY_FEATURES = config.partial_evaluation_params.cartopy_features
 
     run_id_base = (
@@ -216,7 +222,6 @@ def main():
     LEAD_TIME = config.data_params.lead_time
     TIME_SPACING = config.data_params.time_spacing
     GRAD_CLIP = config.training_params.gradient_clip_val
-    FLOW_MATCHING_METHOD = config.flow_matching_params.flow_matching_method
 
     if (
         EARLY_STOPPING_METRIC in ["partial_csi_m", "partial_mse"]
@@ -261,7 +266,7 @@ def main():
     KERNELS_PER_LAYER = model_config["kernels_per_layer"]
 
     if is_main_process:
-        print(f"--- Distributed Training Config ---")
+        print(f"--- Distributed Training Config (DETERMINISTIC ABLATION) ---")
         print(f"World Size: {world_size}")
         print(f"Batch Size PER GPU: {BATCH_SIZE}")
         print(f"Global Batch Size (before accumulation): {BATCH_SIZE * world_size}")
@@ -302,7 +307,6 @@ def main():
         print(f"{DEBUG_PRINT_PREFIX}Lead Time: {LEAD_TIME}")
         print(f"{DEBUG_PRINT_PREFIX}Time Spacing: {TIME_SPACING}")
         print(f"{DEBUG_PRINT_PREFIX}Gradient Clip Value: {GRAD_CLIP}")
-        print(f"{DEBUG_PRINT_PREFIX}Flow Matching Method: {FLOW_MATCHING_METHOD}")
 
         print(f"--------- {DEBUG_PRINT_PREFIX}SmaAt-CFM Config ---------")
         print(f"{DEBUG_PRINT_PREFIX}Base Channels: {BASE_CHANNELS}")
@@ -348,7 +352,7 @@ def main():
             "lead_time": LEAD_TIME,
             "time_spacing": TIME_SPACING,
             "grad_clip": GRAD_CLIP,
-            "flow_matching_method": FLOW_MATCHING_METHOD,
+            "training_mode": "deterministic",
             "dataset": "SEVIR",
             "model": "SmaAt-CFM",
             "optimizer_type": OPTIMIZER_TYPE,
@@ -374,7 +378,7 @@ def main():
             config=config_dict,
         )
 
-    ARTIFACTS_FOLDER = f"artifacts/sevir/smaat_cfm/{MAIN_RUN_ID}"
+    ARTIFACTS_FOLDER = f"artifacts/sevir/smaat_cfm_deterministic/{MAIN_RUN_ID}"
     PLOTS_FOLDER = f"{ARTIFACTS_FOLDER}/plots"
     ANIMATIONS_FOLDER = f"{PLOTS_FOLDER}/animations"
     METRICS_FOLDER = f"{PLOTS_FOLDER}/metrics"
@@ -704,17 +708,6 @@ def main():
         reduction="none"
     )
 
-    sigma = config.flow_matching_params.sigma
-    if FLOW_MATCHING_METHOD == "vanilla":
-        flow_matcher = ConditionalFlowMatcher(sigma=sigma)
-    else:
-        if is_main_process:
-            raise ValueError(f"Invalid flow matching method: {FLOW_MATCHING_METHOD}")
-        else:
-            dist.barrier()
-            cleanup_ddp()
-            sys.exit(1)
-
     ae_model = None
     val_sample_loader = (
         None
@@ -872,7 +865,6 @@ def main():
             inputs, outputs, metadata = batch
             x1 = outputs.to(device, non_blocking=True)
             x0_cond = inputs.to(device, non_blocking=True)
-            x0_noise = torch.randn_like(x1, device=device)
 
             current_model = model.module if world_size > 1 else model
             x0_cond = current_model.normalize(x0_cond)
@@ -881,11 +873,15 @@ def main():
             final_batch_loss = None
 
             with torch.amp.autocast(device_type=device.type, enabled=USE_FP16):
-                t, x_t, u_t = flow_matcher.sample_location_and_conditional_flow(
-                    x0_noise, x1
-                )
-                v_t = model(t, x_t, x0_cond)
-                raw_per_sample_loss = criterion(v_t, u_t)
+                # Deterministic ablation: skip noise/time sampling. The flow
+                # time is fixed at t=1 ("fully resolved") and a zero
+                # placeholder stands in for the noised state x_t, so the
+                # model directly regresses the future latent from the past
+                # conditioning -- see module docstring.
+                x_placeholder = torch.zeros_like(x1)
+                t_full = torch.ones(x1.shape[0], device=device)
+                pred = model(t_full, x_placeholder, x0_cond)
+                raw_per_sample_loss = criterion(pred, x1)
                 dims_to_reduce = list(range(1, raw_per_sample_loss.ndim))
                 sample_losses = raw_per_sample_loss.mean(
                     dim=dims_to_reduce
@@ -978,20 +974,16 @@ def main():
                 inputs, outputs, metadata = batch
                 x1 = outputs.to(device, non_blocking=True)
                 x0_cond = inputs.to(device, non_blocking=True)
-                x0_noise = torch.randn_like(
-                    x1, device=device
-                )
 
                 current_model = model.module if world_size > 1 else model
                 x0_cond = current_model.normalize(x0_cond)
                 x1 = current_model.normalize(x1)
 
                 with torch.amp.autocast(device_type=device.type, enabled=USE_FP16):
-                    t, x_t, u_t = flow_matcher.sample_location_and_conditional_flow(
-                        x0_noise, x1
-                    )
-                    v_t = model(t, x_t, x0_cond)
-                    per_sample_loss = criterion(v_t, u_t)
+                    x_placeholder = torch.zeros_like(x1)
+                    t_full = torch.ones(x1.shape[0], device=device)
+                    pred = model(t_full, x_placeholder, x0_cond)
+                    per_sample_loss = criterion(pred, x1)
                     loss = per_sample_loss.mean()
 
                 val_loss_accum += loss.item() * inputs.size(
@@ -1045,7 +1037,7 @@ def main():
             )
             eval_model.eval()
 
-            partial_eval_results = partial_evaluate_model(
+            partial_eval_results = partial_evaluate_model_deterministic(
                 model=eval_model,
                 device=device,
                 val_sample_loader=val_sample_loader,
@@ -1135,7 +1127,7 @@ def main():
 
     cleanup_ddp()
 
-def partial_evaluate_model(
+def partial_evaluate_model_deterministic(
     model,
     device,
     val_sample_loader,
@@ -1156,14 +1148,15 @@ def partial_evaluate_model(
     batch_size_autoencoder=None,
 ):
     """
-    Runs a partial evaluation on a subset of the validation data.
-
-    This is executed periodically on the main process during training. It generates
-    predictions using ODE integration, decodes them with the autoencoder, calculates
-    nowcasting metrics (CSI, MSE, etc.), and creates animations for visual inspection.
-
-    Note: This function runs only on the main DDP process (rank 0). In the future
-    we can parallelize this function across all processes.
+    Deterministic-mode counterpart of `partial_evaluate_model` in
+    `dist_train_flowcast.py` / `train_smaat_cfm.py`. In CFM mode the model
+    output is a velocity field that must be ODE-integrated from random noise
+    to get a prediction. In deterministic mode the model directly outputs the
+    predicted future latent state (t fixed at 1, x_t replaced by a zero
+    placeholder -- see the training loop above), so there is no ODE to
+    integrate and no ensemble to sample: only ever one prediction per input.
+    The encode/normalize/decode/metrics plumbing otherwise mirrors
+    `partial_evaluate_model` exactly.
 
     Args:
         model (nn.Module): The unwrapped model (or its EMA version) to be evaluated.
@@ -1201,7 +1194,7 @@ def partial_evaluate_model(
                 pool_size=16,
                 compute_mse=True,
                 compute_threshold=True,
-                compute_crps=True,
+                compute_crps=False,
                 compute_fss=True,
                 fss_scales=[1, 4, 16],
                 device=device,
@@ -1213,7 +1206,7 @@ def partial_evaluate_model(
         y_true_batches = []
 
         eval_bar = tqdm(
-            val_sample_loader, desc=f"Partial Eval Epoch {epoch}", leave=False
+            val_sample_loader, desc=f"Partial Eval (deterministic) Epoch {epoch}", leave=False
         )
 
         for batch in eval_bar:
@@ -1274,33 +1267,12 @@ def partial_evaluate_model(
             T_future = x_true.shape[1]
             H_true, W_true = x_true.shape[2], x_true.shape[3]
 
-            x_true_downsampled_example = torch.zeros(
-                (B, T_future, Hz, Wz, Cz), device=device
-            )
-            x0_noise = torch.randn_like(x_true_downsampled_example, device=device)
-            x0_flat = x0_noise.view(B * T_future, Hz, Wz, Cz)
+            x_placeholder = torch.zeros((B, T_future, Hz, Wz, Cz), device=device)
+            t_full = torch.ones(B, device=device)
+            with torch.amp.autocast(device_type=device.type, enabled=use_fp16):
+                x_pred_sample = model(t_full, x_placeholder, x_cond)
 
-            def flow_dynamics(t, x_flat):
-                x_flow_local = x_flat.view(B, T_future, Hz, Wz, Cz)
-                t_batched = t * torch.ones(B, device=x_flow_local.device)
-                with torch.amp.autocast(device_type=device.type, enabled=use_fp16):
-                    v_t = model(t_batched, x_flow_local, x_cond)
-                return v_t.contiguous().view(B * T_future, Hz, Wz, Cz)
-
-            t_span = torch.tensor([0.0, 1.0], device=x0_flat.device)
-
-            solution = odeint(
-                flow_dynamics,
-                x0_flat,
-                t_span,
-                method="euler",
-                options={"step_size": 0.1},
-                adjoint_params=model.parameters(),
-            )
-            x_final_flat = solution[-1]
-            x_pred_sample = x_final_flat.view(B, T_future, Hz, Wz, Cz)
-
-            x_pred = x_pred_sample.unsqueeze(1)
+            x_pred = x_pred_sample.unsqueeze(1)  # single sample -> (B, S=1, T, Hz, Wz, Cz)
 
             x_pred_np = x_pred.cpu().numpy()
             x_true_np = x_true.cpu().numpy()
@@ -1367,7 +1339,7 @@ def partial_evaluate_model(
 
         if not y_pred_batches:
             print(
-                f"{debug_print_prefix}No batches processed during partial evaluation."
+                f"{debug_print_prefix}No batches processed during deterministic partial evaluation."
             )
             return None
 
@@ -1388,7 +1360,7 @@ def partial_evaluate_model(
         )
         EMA_SUFFIX = "(EMA)" if ema_model_evaluated else ""
         print(
-            f"{debug_print_prefix}Partial Results {EMA_SUFFIX}: MSE: {results.get('mse_from_mean_mean', 'N/A')}, "
+            f"{debug_print_prefix}Partial Results (deterministic) {EMA_SUFFIX}: MSE: {results.get('mse_from_mean_mean', 'N/A')}, "
             f"CSI-M: {results.get('csi_from_mean_m', 'N/A')}, CSI (pool)-M: {results.get('csi_pooled_from_mean_m', 'N/A')}, "
             f"HSS-M: {results.get('hss_from_mean_m', 'N/A')}, FAR-M: {results.get('far_from_mean_m', 'N/A')}, "
             f"POD-M: {results.get('pod_from_mean_m', 'N/A')}, FSS-M: {results.get('fss_m_from_mean', 'N/A')}"
@@ -1423,7 +1395,7 @@ def partial_evaluate_model(
             anim1 = make_animation(
                 sample_pred_plot,
                 metadata[0],
-                title=f"Output Epoch {epoch}{EMA_SUFFIX}",
+                title=f"Output (deterministic) Epoch {epoch}{EMA_SUFFIX}",
                 fig=fig1,
                 cartopy_features=cartopy_features,
             )

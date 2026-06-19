@@ -1,58 +1,21 @@
-# Config for the single-GPU training script (train_smaat_cfm.py).
+# Config for train_smaat_cfm.py (primary CFM experiment) and
+# train_smaat_cfm_deterministic.py (diagnostic ablation, same config).
 #
 # training_params/optimizer_params/scheduler_params/data_params/flow_matching_params/
 # ema_model_saving_params/partial_evaluation_params/autoencoder_params/test_params are
 # kept identical in value to experiments/sevir/runner/flowcast/flowcast_config.yaml so
-# the training budget matches the original FlowCast run exactly. Only run_params
-# (backbone_type) and smaat_model are new.
-
-latent_model:
-  base_units: 192
-  scale_alpha: 1.0
-  num_heads: 4
-  attn_drop: 0.1
-  proj_drop: 0.1
-  ffn_drop: 0.1
-  downsample: 2
-  downsample_type: "patch_merge"
-  upsample_type: "upsample"
-  upsample_kernel_size: 3
-  depth: [4, 4]
-  self_pattern: "axial"
-  num_global_vectors: 0
-  use_dec_self_global: false
-  dec_self_update_global: true
-  use_dec_cross_global: false
-  use_global_vector_ffn: false
-  use_global_self_attn: true
-  separate_global_qkv: true
-  global_dim_ratio: 1
-  ffn_activation: "gelu"
-  gated_ffn: false
-  norm_layer: "layer_norm"
-  padding_type: "zeros"
-  pos_embed_type: "t+h+w"
-  checkpoint_level: 0
-  use_relative_pos: true
-  self_attn_use_final_proj: true
-  attn_linear_init_mode: "0"
-  ffn_linear_init_mode: "0"
-  ffn2_linear_init_mode: "2"
-  attn_proj_linear_init_mode: "2"
-  conv_init_mode: "0"
-  down_up_linear_init_mode: "0"
-  global_proj_linear_init_mode: "2"
-  norm_init_mode: "0"
-  time_embed_channels_mult: 4
-  time_embed_use_scale_shift_norm: false
-  time_embed_dropout: 0.0
-  unet_res_connect: True
+# the training budget matches the original FlowCast run exactly -- the backbone
+# (smaat_model below) is the only intended difference. See the project plan for the
+# research justifying each smaat_model default that deviates from the literal
+# official SmaAt-UNet (depth: 4 downsampling stages there vs 2 here, sized for the
+# original's 288x288 pixel input rather than this project's 48x48 VAE latent).
 
 smaat_model:
-  base_channels: 32
-  depth: 5
+  base_channels: 64    # matches the official SmaAt-UNet's first-layer width
+  depth: 3              # 1 stem + 2 downsamples (bottleneck 12x12 on the 48x48 latent)
   time_embed_dim: 128
-  cbam_reduction: 16
+  cbam_reduction: 16     # matches the official SmaAt-UNet's default
+  kernels_per_layer: 2   # matches the official SmaAt-UNet's published default
 
 training_params:
   micro_batch_size: 3
@@ -85,9 +48,7 @@ data_params:
 run_params:
   debug_mode: false
   enable_wandb: true
-  backbone_type: "smaat"  # "smaat" or "cuboid"
-  training_mode: "cfm"  # "cfm" (full Conditional Flow Matching) or "deterministic" (regression ablation)
-  run_string: "cfm_smaat_single_gpu"
+  run_string: "smaat_cfm"
   preload_model: null
 
 flow_matching_params:
